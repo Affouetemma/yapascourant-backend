@@ -8,24 +8,18 @@ const config = require('./config');
 const app = express();
 const PORT = config.PORT;
 
-// Log startup configuration
-console.log('Starting server with configuration:', {
+console.log('Environment:', {
   NODE_ENV: config.NODE_ENV,
   PORT: PORT,
-  MONGODB_URI: config.MONGODB_URI ? '[SET]' : '[NOT SET]',
-  CORS_ENABLED: true
+  MONGODB_URI: config.MONGODB_URI ? '[SET]' : '[NOT SET]'
 });
 
-// More permissive CORS configuration
 app.use(cors({
-  origin: true, // Allow all origins
-  credentials: true,
+  origin: config.CORS_ORIGINS,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
 }));
-
-// Enable pre-flight requests for all routes
-app.options('*', cors());
 
 app.use(express.json());
 
@@ -39,24 +33,9 @@ async function connectDB() {
     await client.connect();
     db = client.db('ya-pas-courant');
     console.log('Connected to MongoDB successfully');
-    
-    // Verify collections exist
-    const collections = await db.listCollections().toArray();
-    const collectionNames = collections.map(c => c.name);
-    console.log('Available collections:', collectionNames);
-    
-    if (!collectionNames.includes('scores')) {
-      await db.createCollection('scores');
-    }
-    if (!collectionNames.includes('votes')) {
-      await db.createCollection('votes');
-    }
-    if (!collectionNames.includes('comments')) {
-      await db.createCollection('comments');
-    }
   } catch (error) {
     console.error('Error connecting to MongoDB:', error);
-    throw error;
+    process.exit(1);
   }
 }
 
@@ -76,17 +55,16 @@ app.get('/api', (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({
+  const status = {
     status: 'ok',
+    db: db ? 'connected' : 'disconnected',
     timestamp: new Date().toISOString(),
-    cors: {
-      origin: req.headers.origin || 'not set',
-      method: req.method,
-      headers: req.headers['access-control-request-headers'] || 'not set'
-    },
-    db: db ? 'connected' : 'not connected',
-    environment: process.env.NODE_ENV || 'not set'
-  });
+    environment: config.NODE_ENV || 'development',
+    port: PORT,
+    mongoUri: config.MONGODB_URI ? 'set' : 'not set'
+  };
+  console.log('Health check:', status);
+  res.json(status);
 });
 
 app.post('/api/scores', async (req, res) => {
@@ -163,14 +141,48 @@ app.get('/api/scores/:game', async (req, res) => {
 
 app.get('/api/scores', async (req, res) => {
   try {
-    if (!db) {
-      await connectDB();
-    }
-    const scores = await db.collection('scores').find().toArray();
+    if (!db) throw new Error('Database not connected');
+    const scores = await db.collection('scores')
+      .aggregate([
+        // Add a field for exact name+location+game matching
+        {
+          $addFields: {
+            playerGameKey: { 
+              $concat: [
+                { $trim: { input: "$name" } },
+                "-",
+                { $trim: { input: "$location" } },
+                "-",
+                { $trim: { input: "$game" } }
+              ]
+            }
+          }
+        },
+        
+        // Sort by date (descending) to get most recent first
+        { $sort: { date: -1 } },
+        
+        // Group by the exact player-game key
+        {
+          $group: {
+            _id: "$playerGameKey",
+            // Keep only the first (most recent) document
+            doc: { $first: "$$ROOT" }
+          }
+        },
+        
+        // Restore the original document structure
+        { $replaceRoot: { newRoot: "$doc" } },
+        
+        // Final sort by score (highest first)
+        { $sort: { score: -1 } }
+      ])
+      .toArray();
+    
     res.json(scores);
   } catch (error) {
     console.error('Error fetching scores:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -179,26 +191,24 @@ app.post('/api/votes', async (req, res) => {
     if (!db) throw new Error('Database not connected');
     const { game } = req.body;
     
-    if (!game) {
-      return res.status(400).json({ error: 'Le jeu est requis pour voter' });
+    // Vérifier si l'utilisateur a déjà voté pour ce jeu (basé sur l'IP)
+    const clientIp = req.ip;
+    const existingVote = await db.collection('votes').findOne({ 
+      game, 
+      clientIp 
+    });
+    
+    if (existingVote) {
+      return res.status(400).json({ error: 'Vous avez déjà voté pour ce jeu' });
     }
 
     const result = await db.collection('votes').insertOne({ 
       game, 
+      clientIp,
       date: new Date() 
     });
     
-    // Récupérer les votes mis à jour
-    const votes = await db.collection('votes')
-      .aggregate([
-        { $group: { _id: '$game', count: { $sum: 1 } } }
-      ])
-      .toArray();
-
-    const voteCounts = { delestage: 0, panne: 0, detective: 0 };
-    votes.forEach(vote => { voteCounts[vote._id] = vote.count });
-
-    res.json(voteCounts);
+    res.json(result);
   } catch (error) {
     console.error('Error saving vote:', error);
     res.status(500).json({ error: error.message });
@@ -207,9 +217,7 @@ app.post('/api/votes', async (req, res) => {
 
 app.get('/api/votes', async (req, res) => {
   try {
-    if (!db) {
-      await connectDB();
-    }
+    if (!db) throw new Error('Database not connected');
     const votes = await db.collection('votes')
       .aggregate([
         { $group: { _id: '$game', count: { $sum: 1 } } }
@@ -218,14 +226,15 @@ app.get('/api/votes', async (req, res) => {
 
     const voteCounts = { delestage: 0, panne: 0, detective: 0 };
     votes.forEach(vote => { voteCounts[vote._id] = vote.count });
+
     res.json(voteCounts);
   } catch (error) {
     console.error('Error fetching votes:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: error.message });
   }
 });
 
-app.post('/api/comments', async (req, res) => {
+app.post('/comments', async (req, res) => {
   try {
     if (!db) throw new Error('Database not connected');
     const { name, comment } = req.body;
@@ -239,11 +248,9 @@ app.post('/api/comments', async (req, res) => {
   }
 });
 
-app.get('/api/comments', async (req, res) => {
+app.get('/comments', async (req, res) => {
   try {
-    if (!db) {
-      await connectDB();
-    }
+    if (!db) throw new Error('Database not connected');
     const comments = await db.collection('comments')
       .find()
       .sort({ timestamp: -1 })
@@ -251,8 +258,8 @@ app.get('/api/comments', async (req, res) => {
       .toArray();
     res.json(comments);
   } catch (error) {
-    console.error('Error fetching comments:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Erreur récupération commentaires:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -303,15 +310,45 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start server
+console.log('Starting server...');
+
 async function startServer() {
   try {
+    // Connect to database first
     await connectDB();
-    app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
+    
+    // Only start server after successful DB connection
+    const server = app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+    console.log('Environment:', config.NODE_ENV || 'development');
+      console.log('CORS enabled for origins:', config.CORS_ORIGINS);
+  });
+
+  server.on('error', (error) => {
+    console.error('Server error:', error);
+    if (error.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use`);
+    }
+      process.exit(1);
     });
+
+    process.on('SIGTERM', () => {
+      console.log('SIGTERM received. Shutting down gracefully...');
+      server.close(() => {
+        console.log('Server closed');
+        if (client) {
+          client.close().then(() => {
+            console.log('Database connection closed');
+            process.exit(0);
+          });
+        } else {
+          process.exit(0);
+        }
+  });
+    });
+
   } catch (error) {
-    console.error('Failed to start server:', error);
+  console.error('Failed to start server:', error);
     process.exit(1);
   }
 }
